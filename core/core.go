@@ -34,6 +34,14 @@ type Core struct {
 	routerSimplePair *routing.SimplePairRouter
 
 	arb *Arbitrator
+
+	// ---- TX destination locking (simple_pair) ----
+	// When TX starts, we pick a destination once and keep it for the duration of the TX session.
+	// TXStop will always use the same destination, even if health changes mid-session.
+	txDestLockDestID  string
+	txDestLockOwnerID string
+	txDestLockSession string
+	txDestLockedAtUTC time.Time
 }
 
 func New(c *config.Config, eps []contract.Endpoint, log Logger) *Core {
@@ -59,7 +67,6 @@ func New(c *config.Config, eps []contract.Endpoint, log Logger) *Core {
 	if c.Routing.Mode == config.ModeSimplePair {
 		r, err := routing.NewSimplePairRouter(c, eps)
 		if err != nil {
-			// Fail fast at startup. (We'll replace this with a clean startup error later.)
 			panic(err)
 		}
 		g.routerSimplePair = r
@@ -94,10 +101,87 @@ func (g *Core) forceReleaseTxLock(reason string) {
 	g.fsm.TXOwner = ""
 	g.fsm.UpdatedAt = time.Now().UTC()
 
+	// Clear destination lock as well (TX ended).
+	g.clearTXDestinationLock("force_release:" + reason)
+
 	g.log.Error("tx_lock_released", map[string]any{
 		"reason":     reason,
 		"prev_owner": prevOwner,
 	})
+}
+
+func (g *Core) clearTXDestinationLock(reason string) {
+	if g.txDestLockDestID == "" && g.txDestLockOwnerID == "" && g.txDestLockSession == "" {
+		return
+	}
+	g.log.Info("tx_destination_unlock", map[string]any{
+		"reason":     reason,
+		"dest":       g.txDestLockDestID,
+		"owner":      g.txDestLockOwnerID,
+		"session_id": g.txDestLockSession,
+		"locked_at":  g.txDestLockedAtUTC.Format(time.RFC3339Nano),
+	})
+	g.txDestLockDestID = ""
+	g.txDestLockOwnerID = ""
+	g.txDestLockSession = ""
+	g.txDestLockedAtUTC = time.Time{}
+}
+
+func (g *Core) lockTXDestination(destID string, ownerID string, sessionID string, reason string) {
+	g.txDestLockDestID = destID
+	g.txDestLockOwnerID = ownerID
+	g.txDestLockSession = sessionID
+	g.txDestLockedAtUTC = time.Now().UTC()
+
+	g.log.Info("tx_destination_lock", map[string]any{
+		"reason":     reason,
+		"dest":       destID,
+		"owner":      ownerID,
+		"session_id": sessionID,
+		"locked_at":  g.txDestLockedAtUTC.Format(time.RFC3339Nano),
+	})
+}
+
+func (g *Core) txSessionIDForLock(e event.Event) string {
+	if e.SessionID != nil && *e.SessionID != "" {
+		return *e.SessionID
+	}
+	return ""
+}
+
+func (g *Core) ensureTXDestinationLocked(ctx context.Context, e event.Event, prev statemachine.Context, reason string) (string, error) {
+	if g.routerSimplePair == nil {
+		return "", fmt.Errorf("router not available")
+	}
+
+	owner := g.fsm.TXOwner
+	if owner == "" {
+		return "", fmt.Errorf("tx owner missing")
+	}
+
+	ownerChanged := prev.State != statemachine.TX || prev.TXOwner != g.fsm.TXOwner
+
+	// If we already have a lock for this owner, keep it.
+	if g.txDestLockDestID != "" && g.txDestLockOwnerID == owner && !ownerChanged {
+		return g.txDestLockDestID, nil
+	}
+
+	destID, _, err := g.routerSimplePair.SelectDestination(ctx)
+	if err != nil {
+		return "", err
+	}
+
+	g.lockTXDestination(destID, owner, g.txSessionIDForLock(e), reason)
+	return destID, nil
+}
+
+// lockedDestinationForTXStop returns the locked destination for this TX session.
+// If no lock exists, returns ("", false) so TXStop can be treated as stale.
+func (g *Core) lockedDestinationForTXStop() (string, bool) {
+	if g.txDestLockDestID == "" {
+		return "", false
+	}
+	return g.txDestLockDestID, true
 }
 
 func (g *Core) Run(ctx context.Context) error {
@@ -142,7 +226,6 @@ func (g *Core) Run(ctx context.Context) error {
 			return nil
 
 		case <-tick:
-			// deterministic lock timeout check
 			if g.arb.Timeout() > 0 && g.fsm.State == statemachine.TX {
 				age := time.Since(g.fsm.UpdatedAt)
 				if age > g.arb.Timeout() {
@@ -161,12 +244,16 @@ func (g *Core) Run(ctx context.Context) error {
 				continue
 			}
 
-			// Apply arbitration gate (TXStart/TXStop only)
+			// Always log receipt first (makes ordering sane)
+			g.log.Info("event_received", map[string]any{
+				"interface_id": e.InterfaceID,
+				"event_type":   string(e.Type),
+			})
+
+			// Arbitration gate
 			decision, err := g.arb.DecideEvent(time.Now().UTC(), string(g.fsm.State), g.fsm.TXOwner, g.fsm.UpdatedAt, e)
 			if err != nil {
-				g.log.Error("arbitration_error", map[string]any{
-					"error": err.Error(),
-				})
+				g.log.Error("arbitration_error", map[string]any{"error": err.Error()})
 				continue
 			}
 			if !decision.Allow {
@@ -179,9 +266,7 @@ func (g *Core) Run(ctx context.Context) error {
 				continue
 			}
 
-			// IMPORTANT:
-			// If arbitration decides this TXStart is a preemption, we must switch TX ownership
-			// BEFORE we process the event through the FSM. Otherwise "tx_stop_not_owner" occurs.
+			// Preempt ownership switch
 			if decision.Preempt {
 				old := g.fsm.TXOwner
 
@@ -191,10 +276,12 @@ func (g *Core) Run(ctx context.Context) error {
 					"new_owner": decision.NewOwner,
 				})
 
-				// Apply ownership switch deterministically.
 				g.fsm.State = statemachine.TX
 				g.fsm.TXOwner = decision.NewOwner
 				g.fsm.UpdatedAt = time.Now().UTC()
+
+				// Clear any previous destination lock.
+				g.clearTXDestinationLock("preempt_owner_switch")
 
 				g.log.Info("tx_owner_switched", map[string]any{
 					"old_owner": old,
@@ -202,7 +289,7 @@ func (g *Core) Run(ctx context.Context) error {
 				})
 			}
 
-			// Add to ring buffer (for API later)
+			// Ring buffer (for API)
 			g.ring.Add(map[string]any{
 				"ts":            e.TS.Format(time.RFC3339Nano),
 				"interface_id":  e.InterfaceID,
@@ -213,21 +300,55 @@ func (g *Core) Run(ctx context.Context) error {
 				"origin_id":     e.OriginID,
 			})
 
-			// FSM step (deterministic)
 			prev := g.fsm
-			next, err := statemachine.Step(g.fsm, statemachine.Input{
+
+			// ---- IMPORTANT: For TXStop, route BEFORE clearing lock / leaving TX ----
+			if g.routerSimplePair != nil && e.Type == event.TXStop {
+				if destID, ok := g.lockedDestinationForTXStop(); ok {
+					sent, cmd, usedDestID, rerr := g.routerSimplePair.HandleWithDestination(ctx, e, destID)
+					if rerr != nil {
+						g.log.Error("route_command_failed", map[string]any{
+							"command": cmd,
+							"error":   rerr.Error(),
+							"source":  e.InterfaceID,
+							"dest":    usedDestID,
+						})
+						// Keep lock if stop failed (deterministic retry behaviour)
+					} else if sent {
+						g.log.Info("command_sent", map[string]any{
+							"command": cmd,
+							"source":  e.InterfaceID,
+							"dest":    usedDestID,
+						})
+						// Only clear lock after successful send
+						g.clearTXDestinationLock("tx_stop_processed")
+					} else {
+						// Sent=false: do NOT clear lock; something is off
+						g.log.Error("tx_stop_not_sent", map[string]any{
+							"source": e.InterfaceID,
+							"dest":   usedDestID,
+						})
+					}
+				} else {
+					// Treat as stale TXStop (e.g. preempted owner arriving late)
+					g.log.Info("tx_stop_ignored_no_lock", map[string]any{
+						"source": e.InterfaceID,
+						"reason": "no_tx_lock_present",
+					})
+				}
+			}
+
+			// FSM step (deterministic)
+			next, serr := statemachine.Step(g.fsm, statemachine.Input{
 				EventType:   e.Type,
 				InterfaceID: e.InterfaceID,
 			})
-			if err != nil {
-				g.log.Error("fsm_error", map[string]any{
-					"error": err.Error(),
-				})
+			if serr != nil {
+				g.log.Error("fsm_error", map[string]any{"error": serr.Error()})
 				continue
 			}
 			g.fsm = next
 
-			// Log state changes only (keeps logs lean)
 			if prev.State != next.State || prev.TXOwner != next.TXOwner {
 				g.log.Info("state_transition", map[string]any{
 					"from":     prev.State,
@@ -236,28 +357,59 @@ func (g *Core) Run(ctx context.Context) error {
 				})
 			}
 
-			// Log event receipt
-			g.log.Info("event_received", map[string]any{
-				"interface_id": e.InterfaceID,
-				"event_type":   string(e.Type),
-			})
+			// Mode-specific routing/action for non-TXStop cases
+			if g.routerSimplePair != nil && e.Type != event.TXStop {
+				switch e.Type {
+				case event.TXStart:
+					lockedDest, lerr := g.ensureTXDestinationLocked(ctx, e, prev, "tx_start_lock")
+					if lerr != nil {
+						g.log.Error("tx_destination_lock_failed", map[string]any{
+							"error":  lerr.Error(),
+							"source": e.InterfaceID,
+						})
+						break
+					}
 
-			// Mode-specific routing/action
-			if g.routerSimplePair != nil {
-				sent, cmd, destID, err := g.routerSimplePair.Handle(ctx, e)
-				if err != nil {
-					g.log.Error("route_command_failed", map[string]any{
-						"command": cmd,
-						"error":   err.Error(),
-						"source":  e.InterfaceID,
-						"dest":    destID,
-					})
-				} else if sent {
-					g.log.Info("command_sent", map[string]any{
-						"command": cmd,
-						"source":  e.InterfaceID,
-						"dest":    destID,
-					})
+					sent, cmd, destID, rerr := g.routerSimplePair.HandleWithDestination(ctx, e, lockedDest)
+					if rerr != nil {
+						g.log.Error("route_command_failed", map[string]any{
+							"command": cmd,
+							"error":   rerr.Error(),
+							"source":  e.InterfaceID,
+							"dest":    destID,
+						})
+					} else if sent {
+						g.log.Info("command_sent", map[string]any{
+							"command": cmd,
+							"source":  e.InterfaceID,
+							"dest":    destID,
+						})
+					}
+
+				default:
+					sent, cmd, destID, rerr := g.routerSimplePair.Handle(ctx, e)
+					if rerr != nil {
+						g.log.Error("route_command_failed", map[string]any{
+							"command": cmd,
+							"error":   rerr.Error(),
+							"source":  e.InterfaceID,
+							"dest":    destID,
+						})
+					} else if sent {
+						g.log.Info("command_sent", map[string]any{
+							"command": cmd,
+							"source":  e.InterfaceID,
+							"dest":    destID,
+						})
+					}
+				}
+			}
+
+			// Defensive: if we left TX, clear any stale lock (should be cleared on successful TXStop)
+			if prev.State == statemachine.TX && g.fsm.State != statemachine.TX {
+				// Only clear if it's still present (e.g., stop failed / timeout / external event)
+				if g.txDestLockDestID != "" {
+					g.clearTXDestinationLock("left_tx_state")
 				}
 			}
 		}

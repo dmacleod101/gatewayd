@@ -3,6 +3,8 @@ package gpio_stub
 import (
 	"context"
 	"fmt"
+	"os"
+	"strings"
 	"sync/atomic"
 
 	"gatewayd/endpoints/contract"
@@ -97,19 +99,37 @@ func (e *Endpoint) PTTUp(ctx context.Context, commandContext map[string]any) err
 	return nil
 }
 
+// demoHealth supports two deterministic overrides:
+//
+// 1) cfg["demo_health"] = "healthy" | "degraded" | "down"
+// 2) cfg["demo_health_file"] = "/path/to/file" containing one of:
+//      healthy | degraded | down
+//
+// If both exist, demo_health_file wins (lets tests flip health at runtime).
 func (e *Endpoint) demoHealth() string {
 	if e.cfg == nil {
 		return ""
 	}
-	v, ok := e.cfg["demo_health"]
-	if !ok {
-		return ""
+
+	// Runtime override via file for deterministic tests.
+	if v, ok := e.cfg["demo_health_file"]; ok {
+		if path, ok2 := v.(string); ok2 && path != "" {
+			b, err := os.ReadFile(path)
+			if err == nil {
+				s := strings.TrimSpace(strings.ToLower(string(b)))
+				return s
+			}
+		}
 	}
-	s, ok := v.(string)
-	if !ok {
-		return ""
+
+	// Static override.
+	if v, ok := e.cfg["demo_health"]; ok {
+		if s, ok2 := v.(string); ok2 {
+			return strings.TrimSpace(strings.ToLower(s))
+		}
 	}
-	return s
+
+	return ""
 }
 
 func (e *Endpoint) HealthCheck(ctx context.Context) (contract.HealthStatus, error) {
@@ -126,6 +146,8 @@ func (e *Endpoint) HealthCheck(ctx context.Context) (contract.HealthStatus, erro
 		return contract.HealthDown, nil
 	case "degraded":
 		return contract.HealthDegraded, nil
+	case "healthy":
+		return contract.HealthHealthy, nil
 	default:
 		return contract.HealthHealthy, nil
 	}
