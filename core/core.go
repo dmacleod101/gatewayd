@@ -32,10 +32,11 @@ type Core struct {
 
 	// routers (only one active per mode for now)
 	routerSimplePair *routing.SimplePairRouter
+	routerRuleBased  *routing.RuleBasedRouter
 
 	arb *Arbitrator
 
-	// ---- TX destination locking (simple_pair) ----
+	// ---- TX destination locking (routing-mode aware) ----
 	// When TX starts, we pick a destination once and keep it for the duration of the TX session.
 	// TXStop will always use the same destination, even if health changes mid-session.
 	txDestLockDestID  string
@@ -64,12 +65,20 @@ func New(c *config.Config, eps []contract.Endpoint, log Logger) *Core {
 	}
 
 	// Mode-specific router wiring
-	if c.Routing.Mode == config.ModeSimplePair {
+	switch c.Routing.Mode {
+	case config.ModeSimplePair:
 		r, err := routing.NewSimplePairRouter(c, eps)
 		if err != nil {
 			panic(err)
 		}
 		g.routerSimplePair = r
+
+	case config.ModeRuleBased:
+		r, err := routing.NewRuleBasedRouter(c, eps)
+		if err != nil {
+			panic(err)
+		}
+		g.routerRuleBased = r
 	}
 
 	return g
@@ -150,10 +159,6 @@ func (g *Core) txSessionIDForLock(e event.Event) string {
 }
 
 func (g *Core) ensureTXDestinationLocked(ctx context.Context, e event.Event, prev statemachine.Context, reason string) (string, error) {
-	if g.routerSimplePair == nil {
-		return "", fmt.Errorf("router not available")
-	}
-
 	owner := g.fsm.TXOwner
 	if owner == "" {
 		return "", fmt.Errorf("tx owner missing")
@@ -166,7 +171,26 @@ func (g *Core) ensureTXDestinationLocked(ctx context.Context, e event.Event, pre
 		return g.txDestLockDestID, nil
 	}
 
-	destID, _, err := g.routerSimplePair.SelectDestination(ctx)
+	var destID string
+	var err error
+
+	switch g.cfg.Routing.Mode {
+	case config.ModeSimplePair:
+		if g.routerSimplePair == nil {
+			return "", fmt.Errorf("router not available (simple_pair)")
+		}
+		destID, _, err = g.routerSimplePair.SelectDestination(ctx)
+
+	case config.ModeRuleBased:
+		if g.routerRuleBased == nil {
+			return "", fmt.Errorf("router not available (rule_based)")
+		}
+		destID, _, err = g.routerRuleBased.SelectDestination(ctx, e)
+
+	default:
+		return "", fmt.Errorf("tx destination locking not supported for mode: %s", g.cfg.Routing.Mode)
+	}
+
 	if err != nil {
 		return "", err
 	}
@@ -213,7 +237,14 @@ func (g *Core) Run(ctx context.Context) error {
 	}
 
 	g.log.Info("core_run_start", map[string]any{
-		"routing_mode": g.cfg.Routing.Mode,
+		"routing_mode":        g.cfg.Routing.Mode,
+		"router_simple_pair":  g.routerSimplePair != nil,
+		"router_rule_based":   g.routerRuleBased != nil,
+		"tx_lock_timeout_ms":  g.cfg.Routing.Arbitration.TXLockTimeoutMS,
+		"arb_policy":          g.cfg.Routing.Arbitration.Policy,
+		"loop_prevention":     g.cfg.Routing.Features.LoopPrevention,
+		"match_subscriber_id": g.cfg.Routing.Features.Match.SubscriberID,
+		"match_talkgroup_id":  g.cfg.Routing.Features.Match.TalkgroupID,
 	})
 
 	for {
@@ -303,32 +334,68 @@ func (g *Core) Run(ctx context.Context) error {
 			prev := g.fsm
 
 			// ---- IMPORTANT: For TXStop, route BEFORE clearing lock / leaving TX ----
-			if g.routerSimplePair != nil && e.Type == event.TXStop {
+			if e.Type == event.TXStop {
 				if destID, ok := g.lockedDestinationForTXStop(); ok {
-					sent, cmd, usedDestID, rerr := g.routerSimplePair.HandleWithDestination(ctx, e, destID)
-					if rerr != nil {
-						g.log.Error("route_command_failed", map[string]any{
-							"command": cmd,
-							"error":   rerr.Error(),
-							"source":  e.InterfaceID,
-							"dest":    usedDestID,
-						})
-						// Keep lock if stop failed (deterministic retry behaviour)
-					} else if sent {
-						g.log.Info("command_sent", map[string]any{
-							"command": cmd,
-							"source":  e.InterfaceID,
-							"dest":    usedDestID,
-						})
-						// Only clear lock after successful send
-						g.clearTXDestinationLock("tx_stop_processed")
-					} else {
-						// Sent=false: do NOT clear lock; something is off
-						g.log.Error("tx_stop_not_sent", map[string]any{
-							"source": e.InterfaceID,
-							"dest":   usedDestID,
-						})
+
+					switch g.cfg.Routing.Mode {
+					case config.ModeSimplePair:
+						if g.routerSimplePair == nil {
+							g.log.Error("route_router_missing", map[string]any{"mode": g.cfg.Routing.Mode})
+							break
+						}
+						sent, cmd, usedDestID, rerr := g.routerSimplePair.HandleWithDestination(ctx, e, destID)
+						if rerr != nil {
+							g.log.Error("route_command_failed", map[string]any{
+								"command": cmd,
+								"error":   rerr.Error(),
+								"source":  e.InterfaceID,
+								"dest":    usedDestID,
+							})
+						} else if sent {
+							g.log.Info("command_sent", map[string]any{
+								"command": cmd,
+								"source":  e.InterfaceID,
+								"dest":    usedDestID,
+							})
+							g.clearTXDestinationLock("tx_stop_processed")
+						} else {
+							g.log.Error("tx_stop_not_sent", map[string]any{
+								"source": e.InterfaceID,
+								"dest":   usedDestID,
+							})
+						}
+
+					case config.ModeRuleBased:
+						if g.routerRuleBased == nil {
+							g.log.Error("route_router_missing", map[string]any{"mode": g.cfg.Routing.Mode})
+							break
+						}
+						sent, cmd, usedDestID, rerr := g.routerRuleBased.HandleWithDestination(ctx, e, destID)
+						if rerr != nil {
+							g.log.Error("route_command_failed", map[string]any{
+								"command": cmd,
+								"error":   rerr.Error(),
+								"source":  e.InterfaceID,
+								"dest":    usedDestID,
+							})
+						} else if sent {
+							g.log.Info("command_sent", map[string]any{
+								"command": cmd,
+								"source":  e.InterfaceID,
+								"dest":    usedDestID,
+							})
+							g.clearTXDestinationLock("tx_stop_processed")
+						} else {
+							g.log.Error("tx_stop_not_sent", map[string]any{
+								"source": e.InterfaceID,
+								"dest":   usedDestID,
+							})
+						}
+
+					default:
+						// No-op
 					}
+
 				} else {
 					// Treat as stale TXStop (e.g. preempted owner arriving late)
 					g.log.Info("tx_stop_ignored_no_lock", map[string]any{
@@ -358,56 +425,117 @@ func (g *Core) Run(ctx context.Context) error {
 			}
 
 			// Mode-specific routing/action for non-TXStop cases
-			if g.routerSimplePair != nil && e.Type != event.TXStop {
-				switch e.Type {
-				case event.TXStart:
-					lockedDest, lerr := g.ensureTXDestinationLocked(ctx, e, prev, "tx_start_lock")
-					if lerr != nil {
-						g.log.Error("tx_destination_lock_failed", map[string]any{
-							"error":  lerr.Error(),
-							"source": e.InterfaceID,
-						})
+			if e.Type != event.TXStop {
+
+				switch g.cfg.Routing.Mode {
+
+				case config.ModeSimplePair:
+					if g.routerSimplePair == nil {
+						g.log.Error("route_router_missing", map[string]any{"mode": g.cfg.Routing.Mode})
 						break
 					}
+					switch e.Type {
+					case event.TXStart:
+						lockedDest, lerr := g.ensureTXDestinationLocked(ctx, e, prev, "tx_start_lock")
+						if lerr != nil {
+							g.log.Error("tx_destination_lock_failed", map[string]any{
+								"error":  lerr.Error(),
+								"source": e.InterfaceID,
+							})
+							break
+						}
 
-					sent, cmd, destID, rerr := g.routerSimplePair.HandleWithDestination(ctx, e, lockedDest)
-					if rerr != nil {
-						g.log.Error("route_command_failed", map[string]any{
-							"command": cmd,
-							"error":   rerr.Error(),
-							"source":  e.InterfaceID,
-							"dest":    destID,
-						})
-					} else if sent {
-						g.log.Info("command_sent", map[string]any{
-							"command": cmd,
-							"source":  e.InterfaceID,
-							"dest":    destID,
-						})
+						sent, cmd, destID, rerr := g.routerSimplePair.HandleWithDestination(ctx, e, lockedDest)
+						if rerr != nil {
+							g.log.Error("route_command_failed", map[string]any{
+								"command": cmd,
+								"error":   rerr.Error(),
+								"source":  e.InterfaceID,
+								"dest":    destID,
+							})
+						} else if sent {
+							g.log.Info("command_sent", map[string]any{
+								"command": cmd,
+								"source":  e.InterfaceID,
+								"dest":    destID,
+							})
+						}
+
+					default:
+						sent, cmd, destID, rerr := g.routerSimplePair.Handle(ctx, e)
+						if rerr != nil {
+							g.log.Error("route_command_failed", map[string]any{
+								"command": cmd,
+								"error":   rerr.Error(),
+								"source":  e.InterfaceID,
+								"dest":    destID,
+							})
+						} else if sent {
+							g.log.Info("command_sent", map[string]any{
+								"command": cmd,
+								"source":  e.InterfaceID,
+								"dest":    destID,
+							})
+						}
+					}
+
+				case config.ModeRuleBased:
+					if g.routerRuleBased == nil {
+						g.log.Error("route_router_missing", map[string]any{"mode": g.cfg.Routing.Mode})
+						break
+					}
+					switch e.Type {
+					case event.TXStart:
+						lockedDest, lerr := g.ensureTXDestinationLocked(ctx, e, prev, "tx_start_lock")
+						if lerr != nil {
+							g.log.Error("tx_destination_lock_failed", map[string]any{
+								"error":  lerr.Error(),
+								"source": e.InterfaceID,
+							})
+							break
+						}
+
+						sent, cmd, destID, rerr := g.routerRuleBased.HandleWithDestination(ctx, e, lockedDest)
+						if rerr != nil {
+							g.log.Error("route_command_failed", map[string]any{
+								"command": cmd,
+								"error":   rerr.Error(),
+								"source":  e.InterfaceID,
+								"dest":    destID,
+							})
+						} else if sent {
+							g.log.Info("command_sent", map[string]any{
+								"command": cmd,
+								"source":  e.InterfaceID,
+								"dest":    destID,
+							})
+						}
+
+					default:
+						sent, cmd, destID, rerr := g.routerRuleBased.Handle(ctx, e)
+						if rerr != nil {
+							g.log.Error("route_command_failed", map[string]any{
+								"command": cmd,
+								"error":   rerr.Error(),
+								"source":  e.InterfaceID,
+								"dest":    destID,
+							})
+						} else if sent {
+							g.log.Info("command_sent", map[string]any{
+								"command": cmd,
+								"source":  e.InterfaceID,
+								"dest":    destID,
+							})
+						}
 					}
 
 				default:
-					sent, cmd, destID, rerr := g.routerSimplePair.Handle(ctx, e)
-					if rerr != nil {
-						g.log.Error("route_command_failed", map[string]any{
-							"command": cmd,
-							"error":   rerr.Error(),
-							"source":  e.InterfaceID,
-							"dest":    destID,
-						})
-					} else if sent {
-						g.log.Info("command_sent", map[string]any{
-							"command": cmd,
-							"source":  e.InterfaceID,
-							"dest":    destID,
-						})
-					}
+					// No-op
 				}
 			}
 
 			// Defensive: if we left TX, clear any stale lock (should be cleared on successful TXStop)
 			if prev.State == statemachine.TX && g.fsm.State != statemachine.TX {
-				// Only clear if it's still present (e.g., stop failed / timeout / external event)
 				if g.txDestLockDestID != "" {
 					g.clearTXDestinationLock("left_tx_state")
 				}
