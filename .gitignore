@@ -1,0 +1,14 @@
+# Compiled binary
+gatewayd
+
+# Go artifacts
+*.exe
+*.test
+*.out
+
+# Editor temp files
+*~
+*.swp
+
+# OS junk
+.DS_Store

@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/gatewayd/config.schema.json",
+  "title": "gatewayd config",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["endpoints", "routing", "api", "logging"],
+  "properties": {
+    "version": { "type": "string", "default": "1" },
+    "endpoints": { "type": "array", "minItems": 1 },
+    "routing": { "type": "object" },
+    "api": { "type": "object" },
+    "logging": { "type": "object" }
+  }
+}
