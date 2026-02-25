@@ -42,7 +42,6 @@ func New(id, typ, driver string, cfg map[string]any) (*Endpoint, error) {
 		return nil, fmt.Errorf("id must not be empty")
 	}
 	if typ == "" {
-		// keep consistent with existing patterns: routing uses Type()
 		typ = "gpio"
 	}
 	if driver == "" {
@@ -56,7 +55,6 @@ func (e *Endpoint) Type() string   { return e.typ }
 func (e *Endpoint) Driver() string { return e.driver }
 
 func (e *Endpoint) Capabilities() contract.Capabilities {
-	// Match gpio_stub behaviour: only emits EventType and does not support indicators.
 	return contract.Capabilities{
 		OutgoingFields: map[contract.FieldName]bool{
 			contract.FieldEventType: true,
@@ -89,7 +87,6 @@ func (e *Endpoint) Connect(ctx context.Context) error {
 		return nil
 	}
 
-	// Parse and validate cfg for GPIO specifics.
 	chip, ok := getString(e.cfg, "chip")
 	if !ok || strings.TrimSpace(chip) == "" {
 		return fmt.Errorf("gpio_gpiod: config.chip is required")
@@ -109,8 +106,6 @@ func (e *Endpoint) Connect(ctx context.Context) error {
 	}
 
 	chipNorm := normalizeChip(chip)
-
-	// Request output line, start inactive.
 	inactive := inactiveValue(activeHigh)
 
 	line, err := gpiocdev.RequestLine(
@@ -130,7 +125,6 @@ func (e *Endpoint) Connect(ctx context.Context) error {
 		return fmt.Errorf("gpio_gpiod: request line failed (chip=%s line=%d): %w", chipNorm, lineOffset, err)
 	}
 
-	// Cache runtime config.
 	e.chip = chipNorm
 	e.lineOffset = lineOffset
 	e.activeHigh = activeHigh
@@ -148,7 +142,6 @@ func (e *Endpoint) Connect(ctx context.Context) error {
 		"active_high":  e.activeHigh,
 	})
 
-	// Keep behaviour consistent with stub.
 	e.emit(contract.Event{EventType: "link_up"})
 	return nil
 }
@@ -192,7 +185,6 @@ func (e *Endpoint) PTTDown(ctx context.Context, commandContext map[string]any) e
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	// Deterministic ack like gpio_stub.
 	e.emit(contract.Event{
 		EventType: "cmd_ack",
 		Meta: map[string]any{
@@ -215,7 +207,6 @@ func (e *Endpoint) PTTDown(ctx context.Context, commandContext map[string]any) e
 		return nil
 	}
 
-	// Cancel any existing pulse.
 	if e.pulseTimer != nil {
 		e.pulseTimer.Stop()
 		e.pulseTimer = nil
@@ -242,7 +233,6 @@ func (e *Endpoint) PTTDown(ctx context.Context, commandContext map[string]any) e
 		"pulse_ms":     e.pulseMS,
 	})
 
-	// Optional pulse.
 	if e.pulseMS > 0 {
 		d := time.Duration(e.pulseMS) * time.Millisecond
 		e.pulseTimer = time.AfterFunc(d, func() {
@@ -317,12 +307,10 @@ func (e *Endpoint) HealthCheck(ctx context.Context) (contract.HealthStatus, erro
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	// Match stub behaviour: if not connected => degraded (not down).
 	if !e.connected.Load() || e.line == nil {
 		return contract.HealthDegraded, nil
 	}
 
-	// Readback sanity check.
 	_, err := e.line.Value()
 	if err != nil {
 		e.logJSON("error", "healthcheck_failed", map[string]any{
@@ -343,6 +331,29 @@ func (e *Endpoint) SetIndicator(ctx context.Context, name string, state string) 
 	_ = name
 	_ = state
 	return contract.ErrNotSupported{What: "set_indicator"}
+}
+
+// ReadAsserted is a helper for tests/diagnostics (not part of contract.Endpoint).
+// It returns true if the line is currently in the "asserted" (PTT active) state.
+func (e *Endpoint) ReadAsserted(ctx context.Context) (bool, error) {
+	_ = ctx
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if !e.connected.Load() || e.line == nil {
+		return false, fmt.Errorf("gpio_gpiod: not connected")
+	}
+
+	v, err := e.line.Value()
+	if err != nil {
+		return false, err
+	}
+
+	if e.activeHigh {
+		return v == 1, nil
+	}
+	return v == 0, nil
 }
 
 // --- helpers ---
@@ -409,7 +420,6 @@ func getBool(m map[string]any, k string) (bool, bool) {
 	if b, ok := v.(bool); ok {
 		return b, true
 	}
-	// JSON numbers/strings sometimes sneak in via map[string]any
 	if s, ok := v.(string); ok {
 		switch strings.ToLower(strings.TrimSpace(s)) {
 		case "true", "1", "yes", "y":
@@ -437,12 +447,10 @@ func getInt(m map[string]any, k string) (int, bool) {
 	case int64:
 		return int(t), true
 	case float64:
-		// encoding/json uses float64 for numbers in interface{}
 		return int(t), true
 	case float32:
 		return int(t), true
 	case string:
-		// best-effort parse
 		var i int
 		_, err := fmt.Sscanf(strings.TrimSpace(t), "%d", &i)
 		if err == nil {
@@ -460,7 +468,6 @@ func (e *Endpoint) logJSON(level string, command string, fields map[string]any) 
 	fields["level"] = level
 	fields["command"] = command
 
-	// Ensure required fields requested by you.
 	if _, ok := fields["interface_id"]; !ok {
 		fields["interface_id"] = e.id
 	}

@@ -49,12 +49,16 @@ func main() {
 	}
 	defer ep.Disconnect(ctx)
 
-	hs, err := ep.HealthCheck(ctx)
+	// Ensure starts deasserted.
+	startAsserted, err := ep.ReadAsserted(ctx)
 	if err != nil {
-		fmt.Printf("ERROR: HealthCheck(): %v\n", err)
+		fmt.Printf("ERROR: ReadAsserted(start): %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("[*] HealthCheck: %v\n", hs)
+	if startAsserted {
+		fmt.Println("ERROR: expected deasserted at start, but line reads asserted=true")
+		os.Exit(1)
+	}
 
 	if err := ep.PTTDown(ctx, map[string]any{"test": true}); err != nil {
 		fmt.Printf("ERROR: PTTDown(): %v\n", err)
@@ -63,6 +67,16 @@ func main() {
 
 	time.Sleep(time.Duration(*holdMS) * time.Millisecond)
 
+	afterDown, err := ep.ReadAsserted(ctx)
+	if err != nil {
+		fmt.Printf("ERROR: ReadAsserted(after down): %v\n", err)
+		os.Exit(1)
+	}
+	if !afterDown {
+		fmt.Println("ERROR: expected asserted=true after PTTDown, but read asserted=false")
+		os.Exit(1)
+	}
+
 	if err := ep.PTTUp(ctx, map[string]any{"test": true}); err != nil {
 		fmt.Printf("ERROR: PTTUp(): %v\n", err)
 		os.Exit(1)
@@ -70,10 +84,15 @@ func main() {
 
 	time.Sleep(50 * time.Millisecond)
 
-	hs2, err := ep.HealthCheck(ctx)
+	afterUp, err := ep.ReadAsserted(ctx)
 	if err != nil {
-		fmt.Printf("ERROR: HealthCheck(after): %v\n", err)
+		fmt.Printf("ERROR: ReadAsserted(after up): %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("OK: gpio_gpiod smoketest passed (health=%v)\n", hs2)
+	if afterUp {
+		fmt.Println("ERROR: expected asserted=false after PTTUp, but read asserted=true")
+		os.Exit(1)
+	}
+
+	fmt.Println("OK: gpio_gpiod smoketest passed (readback verified)")
 }
