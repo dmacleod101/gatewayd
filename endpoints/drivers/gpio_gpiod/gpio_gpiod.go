@@ -29,7 +29,6 @@ type Endpoint struct {
 	lastChange time.Time
 	pulseTimer *time.Timer
 
-	// Parsed GPIO params (cached after Connect())
 	chip       string
 	lineOffset int
 	activeHigh bool
@@ -135,13 +134,21 @@ func (e *Endpoint) Connect(ctx context.Context) error {
 
 	e.connected.Store(true)
 
-	e.logJSON("info", "connect_ok", map[string]any{
+	obsVal, obsAsserted, obsErr := e.readObservedLocked()
+	fields := map[string]any{
 		"interface_id": e.id,
 		"chip":         e.chip,
 		"line":         e.lineOffset,
 		"active_high":  e.activeHigh,
-	})
+	}
+	if obsErr == nil {
+		fields["observed_value"] = obsVal
+		fields["observed_asserted"] = obsAsserted
+	} else {
+		fields["observed_error"] = obsErr.Error()
+	}
 
+	e.logJSON("info", "connect_ok", fields)
 	e.emit(contract.Event{EventType: "link_up"})
 	return nil
 }
@@ -225,13 +232,23 @@ func (e *Endpoint) PTTDown(ctx context.Context, commandContext map[string]any) e
 
 	e.lastChange = time.Now()
 
-	e.logJSON("info", "ptt_down_ok", map[string]any{
+	fields := map[string]any{
 		"interface_id": e.id,
 		"chip":         e.chip,
 		"line":         e.lineOffset,
 		"active_high":  e.activeHigh,
 		"pulse_ms":     e.pulseMS,
-	})
+	}
+
+	obsVal, obsAsserted, obsErr := e.readObservedLocked()
+	if obsErr == nil {
+		fields["observed_value"] = obsVal
+		fields["observed_asserted"] = obsAsserted
+	} else {
+		fields["observed_error"] = obsErr.Error()
+	}
+
+	e.logJSON("info", "ptt_down_ok", fields)
 
 	if e.pulseMS > 0 {
 		d := time.Duration(e.pulseMS) * time.Millisecond
@@ -291,13 +308,22 @@ func (e *Endpoint) PTTUp(ctx context.Context, commandContext map[string]any) err
 
 	e.lastChange = time.Now()
 
-	e.logJSON("info", "ptt_up_ok", map[string]any{
+	fields := map[string]any{
 		"interface_id": e.id,
 		"chip":         e.chip,
 		"line":         e.lineOffset,
 		"active_high":  e.activeHigh,
-	})
+	}
 
+	obsVal, obsAsserted, obsErr := e.readObservedLocked()
+	if obsErr == nil {
+		fields["observed_value"] = obsVal
+		fields["observed_asserted"] = obsAsserted
+	} else {
+		fields["observed_error"] = obsErr.Error()
+	}
+
+	e.logJSON("info", "ptt_up_ok", fields)
 	return nil
 }
 
@@ -334,29 +360,31 @@ func (e *Endpoint) SetIndicator(ctx context.Context, name string, state string) 
 }
 
 // ReadAsserted is a helper for tests/diagnostics (not part of contract.Endpoint).
-// It returns true if the line is currently in the "asserted" (PTT active) state.
 func (e *Endpoint) ReadAsserted(ctx context.Context) (bool, error) {
 	_ = ctx
-
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
 	if !e.connected.Load() || e.line == nil {
 		return false, fmt.Errorf("gpio_gpiod: not connected")
 	}
-
-	v, err := e.line.Value()
-	if err != nil {
-		return false, err
-	}
-
-	if e.activeHigh {
-		return v == 1, nil
-	}
-	return v == 0, nil
+	_, asserted, err := e.readObservedLocked()
+	return asserted, err
 }
 
-// --- helpers ---
+func (e *Endpoint) readObservedLocked() (value int, asserted bool, err error) {
+	if e.line == nil {
+		return 0, false, fmt.Errorf("no line")
+	}
+	v, err := e.line.Value()
+	if err != nil {
+		return 0, false, err
+	}
+	if e.activeHigh {
+		return v, v == 1, nil
+	}
+	return v, v == 0, nil
+}
 
 func (e *Endpoint) shouldDebounceLocked() bool {
 	if e.debounceMS <= 0 || e.lastChange.IsZero() {
