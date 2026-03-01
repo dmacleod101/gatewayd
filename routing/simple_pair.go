@@ -15,7 +15,10 @@ type SimplePairRouter struct {
 	// so arbitration/preemption is meaningful across mcptt_a/mcptt_b/etc.
 	allowedSources map[string]bool
 
-	// Priority-ordered destination candidates
+	// Configured primary MCPTT source (used for reverse mapping: radio COR -> MCPTT PTT)
+	sourceID string
+
+	// Priority-ordered destination candidates (typically radios)
 	destIDs []string
 
 	// whether to choose first healthy dest
@@ -37,6 +40,7 @@ func NewSimplePairRouter(cfg *config.Config, eps []contract.Endpoint) (*SimplePa
 
 	r := &SimplePairRouter{
 		allowedSources:  map[string]bool{},
+		sourceID:        sp.Source,
 		destIDs:         destIDs,
 		failoverEnabled: cfg.Routing.Failover.Enabled,
 		endpoints:       map[string]contract.Endpoint{},
@@ -56,18 +60,21 @@ func NewSimplePairRouter(cfg *config.Config, eps []contract.Endpoint) (*SimplePa
 		}
 	}
 
+	// Validate configured source exists (required for reverse mapping behavior)
+	if r.sourceID == "" {
+		return nil, fmt.Errorf("simple_pair source must not be empty")
+	}
+	if r.endpoints[r.sourceID] == nil {
+		return nil, fmt.Errorf("simple_pair source endpoint not found: %s", r.sourceID)
+	}
+
 	// Determine allowed sources:
-	// 1) Always include the configured source if present.
+	// 1) Always include the configured source.
 	// 2) Additionally include *all* endpoints of type "mcptt".
 	//
 	// This allows multiple MCPTT clients (mcptt_a, mcptt_b, ...) to compete and preempt,
 	// while still keeping routing deterministic and safe.
-	if sp.Source != "" {
-		if r.endpoints[sp.Source] == nil {
-			return nil, fmt.Errorf("simple_pair source endpoint not found: %s", sp.Source)
-		}
-		r.allowedSources[sp.Source] = true
-	}
+	r.allowedSources[r.sourceID] = true
 
 	for _, ep := range eps {
 		if strings.EqualFold(ep.Type(), "mcptt") {
@@ -93,8 +100,17 @@ func (r *SimplePairRouter) isAllowedSource(interfaceID string) bool {
 	return r.allowedSources[interfaceID]
 }
 
-// HandleWithDestination routes TXStart/TXStop to a specific destination ID WITHOUT re-selecting
-// and WITHOUT performing health checks. This is required for destination locking across a TX session.
+func (r *SimplePairRouter) isDestination(interfaceID string) bool {
+	for _, id := range r.destIDs {
+		if id == interfaceID {
+			return true
+		}
+	}
+	return false
+}
+
+// HandleWithDestination routes TXStart/TXStop (and RXStart/RXStop for MCPTT mirroring) to a specific destination ID
+// WITHOUT re-selecting and WITHOUT performing health checks. This is required for destination locking across a TX session.
 func (r *SimplePairRouter) HandleWithDestination(ctx context.Context, ev event.Event, destID string) (bool, string, string, error) {
 	// Only route from allowed mcptt sources
 	if !r.isAllowedSource(ev.InterfaceID) {
@@ -110,9 +126,13 @@ func (r *SimplePairRouter) HandleWithDestination(ctx context.Context, ev event.E
 	}
 
 	switch ev.Type {
-	case event.TXStart:
+	case event.TXStart, event.RXStart:
+		reason := "simple_pair_tx_start"
+		if ev.Type == event.RXStart {
+			reason = "simple_pair_rx_start"
+		}
 		if err := dest.PTTDown(ctx, map[string]any{
-			"reason":       "simple_pair_tx_start",
+			"reason":       reason,
 			"source":       ev.InterfaceID,
 			"event_type":   string(ev.Type),
 			"event_ts_utc": ev.TS.Format("2006-01-02T15:04:05.999999999Z07:00"),
@@ -123,9 +143,13 @@ func (r *SimplePairRouter) HandleWithDestination(ctx context.Context, ev event.E
 		}
 		return true, "ptt_down", destID, nil
 
-	case event.TXStop:
+	case event.TXStop, event.RXStop:
+		reason := "simple_pair_tx_stop"
+		if ev.Type == event.RXStop {
+			reason = "simple_pair_rx_stop"
+		}
 		if err := dest.PTTUp(ctx, map[string]any{
-			"reason":       "simple_pair_tx_stop",
+			"reason":       reason,
 			"source":       ev.InterfaceID,
 			"event_type":   string(ev.Type),
 			"event_ts_utc": ev.TS.Format("2006-01-02T15:04:05.999999999Z07:00"),
@@ -177,6 +201,47 @@ func (r *SimplePairRouter) selectDestination(ctx context.Context) (string, contr
 
 // Handle returns (commandSent, commandName, destinationID, err).
 func (r *SimplePairRouter) Handle(ctx context.Context, ev event.Event) (bool, string, string, error) {
+	// Reverse path: radio COR (RXStart/RXStop) -> MCPTT PTT (Down/Up).
+	// Only configured destinations may trigger the configured source endpoint.
+	if r.isDestination(ev.InterfaceID) {
+		src := r.endpoints[r.sourceID]
+		if src == nil {
+			return false, "", r.sourceID, fmt.Errorf("source endpoint not found: %s", r.sourceID)
+		}
+
+		switch ev.Type {
+		case event.RXStart:
+			if err := src.PTTDown(ctx, map[string]any{
+				"reason":       "simple_pair_radio_rx_start",
+				"source":       ev.InterfaceID,
+				"event_type":   string(ev.Type),
+				"event_ts_utc": ev.TS.Format("2006-01-02T15:04:05.999999999Z07:00"),
+				"dest":         r.sourceID,
+				"locked":       false,
+			}); err != nil {
+				return false, "ptt_down", r.sourceID, err
+			}
+			return true, "ptt_down", r.sourceID, nil
+
+		case event.RXStop:
+			if err := src.PTTUp(ctx, map[string]any{
+				"reason":       "simple_pair_radio_rx_stop",
+				"source":       ev.InterfaceID,
+				"event_type":   string(ev.Type),
+				"event_ts_utc": ev.TS.Format("2006-01-02T15:04:05.999999999Z07:00"),
+				"dest":         r.sourceID,
+				"locked":       false,
+			}); err != nil {
+				return false, "ptt_up", r.sourceID, err
+			}
+			return true, "ptt_up", r.sourceID, nil
+		}
+
+		// Not an RXStart/RXStop; ignore.
+		return false, "", "", nil
+	}
+
+	// Forward path: MCPTT TX/RX -> Radio PTT (Down/Up)
 	// Only route from allowed mcptt sources
 	if !r.isAllowedSource(ev.InterfaceID) {
 		return false, "", "", nil
@@ -185,9 +250,9 @@ func (r *SimplePairRouter) Handle(ctx context.Context, ev event.Event) (bool, st
 	destID, dest, err := r.selectDestination(ctx)
 	if err != nil {
 		switch ev.Type {
-		case event.TXStart:
+		case event.TXStart, event.RXStart:
 			return false, "ptt_down", "", err
-		case event.TXStop:
+		case event.TXStop, event.RXStop:
 			return false, "ptt_up", "", err
 		default:
 			return false, "", "", nil
@@ -195,9 +260,13 @@ func (r *SimplePairRouter) Handle(ctx context.Context, ev event.Event) (bool, st
 	}
 
 	switch ev.Type {
-	case event.TXStart:
+	case event.TXStart, event.RXStart:
+		reason := "simple_pair_tx_start"
+		if ev.Type == event.RXStart {
+			reason = "simple_pair_rx_start"
+		}
 		if err := dest.PTTDown(ctx, map[string]any{
-			"reason":       "simple_pair_tx_start",
+			"reason":       reason,
 			"source":       ev.InterfaceID,
 			"event_type":   string(ev.Type),
 			"event_ts_utc": ev.TS.Format("2006-01-02T15:04:05.999999999Z07:00"),
@@ -208,9 +277,13 @@ func (r *SimplePairRouter) Handle(ctx context.Context, ev event.Event) (bool, st
 		}
 		return true, "ptt_down", destID, nil
 
-	case event.TXStop:
+	case event.TXStop, event.RXStop:
+		reason := "simple_pair_tx_stop"
+		if ev.Type == event.RXStop {
+			reason = "simple_pair_rx_stop"
+		}
 		if err := dest.PTTUp(ctx, map[string]any{
-			"reason":       "simple_pair_tx_stop",
+			"reason":       reason,
 			"source":       ev.InterfaceID,
 			"event_type":   string(ev.Type),
 			"event_ts_utc": ev.TS.Format("2006-01-02T15:04:05.999999999Z07:00"),
