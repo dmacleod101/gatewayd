@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"gatewayd/core/config"
@@ -24,6 +25,9 @@ type Core struct {
 
 	req event.Requirements
 	fsm statemachine.Context
+
+	// Snapshot of FSM for lock-free reads (e.g., HTTP API)
+	fsmSnap atomic.Value // stores statemachine.Context
 
 	ring *RingBuffer
 	log  Logger
@@ -64,6 +68,9 @@ func New(c *config.Config, eps []contract.Endpoint, log Logger) *Core {
 		arb:       NewArbitrator(c.Routing.Arbitration),
 	}
 
+	// Seed snapshot immediately so API reads are valid even before first event
+	g.fsmSnap.Store(g.fsm)
+
 	// Mode-specific router wiring
 	switch c.Routing.Mode {
 	case config.ModeSimplePair:
@@ -82,6 +89,19 @@ func New(c *config.Config, eps []contract.Endpoint, log Logger) *Core {
 	}
 
 	return g
+}
+
+// FSMSnapshot returns the most recent FSM context snapshot.
+// Safe for concurrent access without locking the core loop.
+func (g *Core) FSMSnapshot() statemachine.Context {
+	v := g.fsmSnap.Load()
+	if v == nil {
+		return statemachine.New()
+	}
+	if st, ok := v.(statemachine.Context); ok {
+		return st
+	}
+	return statemachine.New()
 }
 
 func (g *Core) IngestEndpointEvent(interfaceID string, ev contract.Event) error {
@@ -109,6 +129,9 @@ func (g *Core) forceReleaseTxLock(reason string) {
 	g.fsm.State = statemachine.Idle
 	g.fsm.TXOwner = ""
 	g.fsm.UpdatedAt = time.Now().UTC()
+
+	// Keep snapshot in sync
+	g.fsmSnap.Store(g.fsm)
 
 	// Clear destination lock as well (TX ended).
 	g.clearTXDestinationLock("force_release:" + reason)
@@ -311,6 +334,9 @@ func (g *Core) Run(ctx context.Context) error {
 				g.fsm.TXOwner = decision.NewOwner
 				g.fsm.UpdatedAt = time.Now().UTC()
 
+				// Keep snapshot in sync
+				g.fsmSnap.Store(g.fsm)
+
 				// Clear any previous destination lock.
 				g.clearTXDestinationLock("preempt_owner_switch")
 
@@ -415,6 +441,9 @@ func (g *Core) Run(ctx context.Context) error {
 				continue
 			}
 			g.fsm = next
+
+			// Keep snapshot in sync
+			g.fsmSnap.Store(g.fsm)
 
 			if prev.State != next.State || prev.TXOwner != next.TXOwner {
 				g.log.Info("state_transition", map[string]any{

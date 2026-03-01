@@ -1,0 +1,15 @@
+{
+  "name": "mcptt-bridge",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Headless MCPTT bridge (Streamwide JS in headless Chromium) for gatewayd",
+  "main": "bridge.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node bridge.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "playwright": "^1.50.1"
+  }
+}

@@ -7,6 +7,7 @@ import (
 	"gatewayd/endpoints/contract"
 	"gatewayd/endpoints/drivers/gpio_gpiod"
 	"gatewayd/endpoints/drivers/gpio_stub"
+	"gatewayd/endpoints/drivers/mcptt_http"
 	"gatewayd/endpoints/drivers/mcptt_stub"
 )
 
@@ -25,6 +26,9 @@ func Build(c *config.Config) ([]contract.Endpoint, error) {
 		switch ce.Driver {
 		case "mcptt_stub":
 			ep, err = mcptt_stub.New(ce.ID, ce.Type, ce.Driver, ce.Config)
+
+		case "mcptt_http":
+			ep, err = mcptt_http.New(ce.ID, ce.Type, ce.Driver, ce.Config)
 
 		case "gpio_stub":
 			ep, err = gpio_stub.New(ce.ID, ce.Type, ce.Driver, ce.Config)
