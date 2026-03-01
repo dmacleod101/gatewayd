@@ -54,37 +54,30 @@ The system is built around a Go core (`gatewayd`) with pluggable endpoint driver
 ## 🔧 Core Capabilities
 
 ### Deterministic Routing Modes
-simple_pair
+## 'simple_pair'
 
-Deterministic pairing between one configured source endpoint and one or more destination endpoints.
+Deterministic pairing between one configured **source endpoint** and one or more **destination endpoints.**
 
 Used for standard MCPTT ↔ Radio gateway deployments.
 
-Forward path (MCPTT → Radio)
+**Forward path (MCPTT → Radio)**
+- `TXStart` or `RXStart` on the configured source → `PTTDown` on selected destination
+- `TXStop` or `RXStop` on the configured source → `PTTUp` on selected destination
 
-TXStart or RXStart on the configured source
-→ PTTDown on selected destination
+**Reverse path (Radio COR → MCPTT)**
 
-TXStop or RXStop on the configured source
-→ PTTUp on selected destination
-
-Reverse path (Radio COR → MCPTT)
-
-RXStart on a configured destination
-→ PTTDown on configured source
-
-RXStop on a configured destination
-→ PTTUp on configured source
+- `RXStart` on a configured destination → `PTTDown` on configured source
+- `RXStop` on a configured destination → `PTTUp` on configured source
 
 This enables bidirectional MCPTT ↔ Radio operation in simple deployments.
 
-rule_based
+#### `rule_based`
 
 Rule-driven routing based on interface ID, subscriber ID, or talkgroup ID.
 
-multi_endpoint_bridge (planned)
+#### `multi_endpoint_bridge` (planned)
 
-Planned symmetrical multi-endpoint bridging mode for complex deployments.
+Planned symmetrical multi-endpoint bridging mode for complex deployments
 
 ### Arbitration Modes
 
