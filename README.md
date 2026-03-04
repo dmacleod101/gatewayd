@@ -249,6 +249,21 @@ Testing is performed at three levels:
 - Radio to MCPTT
 - Rapid key transitions
 
+## Useful Testing Commands
+```
+sudo systemctl status gatewayd mcptt-bridge --no-pager
+```
+### Purpose
+Confirms the core services are running.
+
+Expected:
+
+```
+active (running)
+```
+If either service is failed or inactive, the UI will not function correctly.
+
+
 Stable checkpoints are tagged in Git:
 
 ```
