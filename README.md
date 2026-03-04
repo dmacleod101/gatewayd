@@ -250,20 +250,35 @@ Testing is performed at three levels:
 - Rapid key transitions
 
 ## Useful Testing Commands
-### Check gateway services are running
+### 1. Check gateway services are running
 ```
 sudo systemctl status gatewayd mcptt-bridge --no-pager
 ```
 #### Purpose
 Confirms the core services are running.
 
-Expected:
+#### Expected
 
 ```
 active (running)
 ```
 If either service is failed or inactive, the UI will not function correctly.
 
+### 2. Check the services are listening on the expected ports
+
+```
+sudo ss -tulpen | grep -E '5071|5072'
+```
+#### Purpose
+Confirms the core services are running.
+
+#### Expected Ports
+| Port | Service |
+|-------|--------------|
+| 5071  |gatewayd API  |
+| 5072  | mcptt-bridge API |
+
+---
 
 Stable checkpoints are tagged in Git:
 
