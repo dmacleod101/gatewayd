@@ -250,10 +250,11 @@ Testing is performed at three levels:
 - Rapid key transitions
 
 ## Useful Testing Commands
+### Check gateway services are running
 ```
 sudo systemctl status gatewayd mcptt-bridge --no-pager
 ```
-### Purpose
+#### Purpose
 Confirms the core services are running.
 
 Expected:
