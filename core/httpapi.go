@@ -3,7 +3,10 @@ package core
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -18,16 +21,188 @@ type httpAPI struct {
 func StartHTTPAPI(ctx context.Context, listenAddr string, g *Core, log Logger) *http.Server {
 	mux := http.NewServeMux()
 
+	writeJSON := func(w http.ResponseWriter, status int, v any) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_ = json.NewEncoder(w).Encode(v)
+	}
+
+	// ----------------------------
+	// UI (static)
+	// ----------------------------
+	// Serve /ui/* from /opt/gatewayd/ui (or override with GATEWAYD_UI_DIR)
+	uiDir := strings.TrimSpace(os.Getenv("GATEWAYD_UI_DIR"))
+	if uiDir == "" {
+		uiDir = "/opt/gatewayd/ui"
+	}
+	uiDir = filepath.Clean(uiDir)
+
+	// Redirect root -> /ui/
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		http.Redirect(w, r, "/ui/", http.StatusFound)
+	})
+
+	// Static file server under /ui/
+	mux.Handle("/ui/", http.StripPrefix("/ui/", http.FileServer(http.Dir(uiDir))))
+
 	// ----------------------------
 	// Liveness
 	// ----------------------------
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
+		writeJSON(w, 200, map[string]any{
 			"ok":  true,
 			"ts":  time.Now().UTC().Format(time.RFC3339Nano),
 			"svc": "gatewayd",
 		})
+	})
+
+	// ----------------------------
+	// gatewayd health (for UI convenience)
+	// ----------------------------
+	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
+		st := g.FSMSnapshot()
+		writeJSON(w, 200, map[string]any{
+			"ok": true,
+			"runtime": map[string]any{
+				"started": true,
+				"now":     time.Now().UnixMilli(),
+			},
+			"state": map[string]any{
+				"fsm_state":    st.State,
+				"tx_owner":     st.TXOwner,
+				"fsm_updated":  st.UpdatedAt.Format(time.RFC3339Nano),
+				"service_name": "gatewayd",
+			},
+		})
+	})
+
+	// ----------------------------
+	// mcptt-bridge health proxy
+	// ----------------------------
+	mux.HandleFunc("/api/mcptt/health", func(w http.ResponseWriter, r *http.Request) {
+		bridgeURL := strings.TrimSpace(os.Getenv("MCPTT_BRIDGE_URL"))
+		if bridgeURL == "" {
+			bridgeURL = "http://127.0.0.1:5072"
+		}
+		target := strings.TrimRight(bridgeURL, "/") + "/api/health"
+
+		client := &http.Client{Timeout: 2 * time.Second}
+		resp, err := client.Get(target)
+		if err != nil {
+			writeJSON(w, 502, map[string]any{
+				"ok":    false,
+				"error": "bridge_unreachable",
+				"meta": map[string]any{
+					"target": target,
+					"detail": err.Error(),
+				},
+			})
+			return
+		}
+		defer resp.Body.Close()
+
+		var payload any
+		dec := json.NewDecoder(resp.Body)
+		if err := dec.Decode(&payload); err != nil {
+			writeJSON(w, 502, map[string]any{
+				"ok":    false,
+				"error": "bridge_invalid_json",
+				"meta": map[string]any{
+					"target": target,
+					"detail": err.Error(),
+				},
+			})
+			return
+		}
+
+		// Pass through the bridge payload, but keep a consistent outer shape if it isn't JSON object.
+		writeJSON(w, resp.StatusCode, payload)
+	})
+
+	// ----------------------------
+	// mcptt_a (session control proxy to mcptt-bridge)
+	// ----------------------------
+	proxyMCPTT := func(w http.ResponseWriter, r *http.Request, method string, path string) {
+		bridgeURL := strings.TrimSpace(os.Getenv("MCPTT_BRIDGE_URL"))
+		if bridgeURL == "" {
+			bridgeURL = "http://127.0.0.1:5072"
+		}
+		target := strings.TrimRight(bridgeURL, "/") + path
+
+		req, err := http.NewRequest(method, target, nil)
+		if err != nil {
+			writeJSON(w, 500, map[string]any{
+				"ok":    false,
+				"error": "proxy_request_build_failed",
+				"meta":  map[string]any{"detail": err.Error()},
+			})
+			return
+		}
+
+		client := &http.Client{Timeout: 4 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil {
+			writeJSON(w, 502, map[string]any{
+				"ok":    false,
+				"error": "bridge_unreachable",
+				"meta": map[string]any{
+					"target": target,
+					"detail": err.Error(),
+				},
+			})
+			return
+		}
+		defer resp.Body.Close()
+
+		// Try to decode JSON; if it isn't JSON, pass text through.
+		var payload any
+		dec := json.NewDecoder(resp.Body)
+		if err := dec.Decode(&payload); err != nil {
+			// fallback: plain text
+			b, _ := io.ReadAll(resp.Body)
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			w.WriteHeader(resp.StatusCode)
+			_, _ = w.Write(b)
+			return
+		}
+
+		writeJSON(w, resp.StatusCode, payload)
+	}
+
+	mux.HandleFunc("/api/endpoints/mcptt_a/session/start", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		proxyMCPTT(w, r, http.MethodPost, "/api/session/start")
+	})
+
+	mux.HandleFunc("/api/endpoints/mcptt_a/session/stop", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		proxyMCPTT(w, r, http.MethodPost, "/api/session/stop")
+	})
+
+	mux.HandleFunc("/api/endpoints/mcptt_a/ptt/down", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		proxyMCPTT(w, r, http.MethodPost, "/api/ptt/down")
+	})
+
+	mux.HandleFunc("/api/endpoints/mcptt_a/ptt/up", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		proxyMCPTT(w, r, http.MethodPost, "/api/ptt/up")
 	})
 
 	// ----------------------------
@@ -36,8 +211,7 @@ func StartHTTPAPI(ctx context.Context, listenAddr string, g *Core, log Logger) *
 	mux.HandleFunc("/api/state", func(w http.ResponseWriter, r *http.Request) {
 		st := g.FSMSnapshot()
 
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
+		writeJSON(w, 200, map[string]any{
 			"ts": time.Now().UTC().Format(time.RFC3339Nano),
 			"fsm": map[string]any{
 				"state":      st.State,
@@ -51,7 +225,6 @@ func StartHTTPAPI(ctx context.Context, listenAddr string, g *Core, log Logger) *
 	// Ring buffer events
 	// ----------------------------
 	mux.HandleFunc("/api/events", func(w http.ResponseWriter, r *http.Request) {
-
 		events := g.ring.Snapshot()
 
 		// Optional ?limit=50
@@ -64,8 +237,7 @@ func StartHTTPAPI(ctx context.Context, listenAddr string, g *Core, log Logger) *
 			}
 		}
 
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
+		writeJSON(w, 200, map[string]any{
 			"ts":     time.Now().UTC().Format(time.RFC3339Nano),
 			"count":  len(events),
 			"events": events,
@@ -88,7 +260,6 @@ func StartHTTPAPI(ctx context.Context, listenAddr string, g *Core, log Logger) *
 		}
 
 		// Avoid importing event package here by round-tripping via JSON.
-		// This keeps it resilient to event struct changes without needing module path knowledge.
 		raw, err := json.Marshal(events)
 		if err != nil {
 			http.Error(w, "failed to marshal events", http.StatusInternalServerError)
@@ -118,7 +289,6 @@ func StartHTTPAPI(ctx context.Context, listenAddr string, g *Core, log Logger) *
 			PttLastUpdated string `json:"ptt_updated_at,omitempty"`
 		}
 
-		// Event classifiers (tolerant). We can tighten once we see your actual event_type vocabulary.
 		isRx := func(t string) bool {
 			t = strings.ToLower(t)
 			return strings.Contains(t, "rx") ||
@@ -137,7 +307,6 @@ func StartHTTPAPI(ctx context.Context, listenAddr string, g *Core, log Logger) *
 			return strings.Contains(t, "ptt")
 		}
 		pttValue := func(t string) (bool, bool) {
-			// returns (value, ok)
 			tl := strings.ToLower(t)
 			if strings.Contains(tl, "down") || strings.Contains(tl, "assert") || strings.Contains(tl, "start") {
 				return true, true
@@ -150,7 +319,6 @@ func StartHTTPAPI(ctx context.Context, listenAddr string, g *Core, log Logger) *
 
 		byIface := map[string]*ifaceIO{}
 
-		// Treat later items as “newer”.
 		for _, e := range arr {
 			iface, _ := e["interface_id"].(string)
 			if iface == "" {
@@ -165,11 +333,9 @@ func StartHTTPAPI(ctx context.Context, listenAddr string, g *Core, log Logger) *
 				byIface[iface] = s
 			}
 
-			// last event of any type
 			s.LastEventType = et
 			s.LastEventTs = ts
 
-			// rx/tx/ptt buckets
 			if isRx(et) {
 				s.LastRxType = et
 				s.LastRxTs = ts
@@ -189,7 +355,6 @@ func StartHTTPAPI(ctx context.Context, listenAddr string, g *Core, log Logger) *
 			}
 		}
 
-		// stable output ordering
 		keys := make([]string, 0, len(byIface))
 		for k := range byIface {
 			keys = append(keys, k)
@@ -201,8 +366,7 @@ func StartHTTPAPI(ctx context.Context, listenAddr string, g *Core, log Logger) *
 			out = append(out, byIface[k])
 		}
 
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
+		writeJSON(w, 200, map[string]any{
 			"ts":                time.Now().UTC().Format(time.RFC3339Nano),
 			"events_considered": len(arr),
 			"ifaces":            out,
@@ -218,6 +382,7 @@ func StartHTTPAPI(ctx context.Context, listenAddr string, g *Core, log Logger) *
 	go func() {
 		log.Info("http_api_start", map[string]any{
 			"listen": listenAddr,
+			"ui_dir": uiDir,
 		})
 		err := srv.ListenAndServe()
 		if err != nil && err != http.ErrServerClosed {

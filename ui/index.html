@@ -1,0 +1,444 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Gateway Manager</title>
+  <style>
+    :root{
+      --bg:#0b1220; --card:#111a2e; --muted:#9fb0d0; --text:#e9eefc;
+      --ok:#38d39f; --warn:#f6c177; --bad:#ff6b6b; --line:#223056;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      --sans: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji";
+    }
+    *{box-sizing:border-box}
+    body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans)}
+    header{padding:16px 18px;border-bottom:1px solid var(--line);display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+    header .brand{font-weight:700;letter-spacing:.2px}
+    header .pill{font-family:var(--mono);font-size:12px;padding:4px 8px;border:1px solid var(--line);border-radius:999px;color:var(--muted)}
+    header .pill b{color:var(--text);font-weight:600}
+    header .right{margin-left:auto;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+    button{
+      background:transparent;color:var(--text);border:1px solid var(--line);
+      padding:8px 10px;border-radius:10px;cursor:pointer;font-family:var(--sans)
+    }
+    button:hover{border-color:#3a4a77}
+    button:disabled{opacity:.55;cursor:not-allowed}
+    .btnPrimary{border-color:#3a4a77}
+    .btnDanger{border-color:#6b2d3b}
+    .btnDanger:hover{border-color:#9b3a50}
+    .wrap{padding:16px 18px;max-width:1400px;margin:0 auto}
+    .grid{display:grid;gap:14px}
+    @media(min-width:980px){ .grid{grid-template-columns:1.2fr 1fr} }
+    .card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:14px}
+    .card h2{margin:0 0 10px 0;font-size:14px;color:#cfe0ff;letter-spacing:.2px}
+    .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+    .kvs{display:grid;grid-template-columns: 160px 1fr;gap:6px 10px;align-items:start}
+    .k{color:var(--muted);font-size:12px}
+    .v{font-family:var(--mono);font-size:12px;white-space:pre-wrap;word-break:break-word}
+    .badge{font-family:var(--mono);font-size:12px;padding:3px 8px;border-radius:999px;border:1px solid var(--line);display:inline-flex;gap:6px;align-items:center}
+    .dot{width:8px;height:8px;border-radius:999px;background:var(--muted)}
+    .ok{color:var(--ok)} .ok .dot{background:var(--ok)}
+    .warn{color:var(--warn)} .warn .dot{background:var(--warn)}
+    .bad{color:var(--bad)} .bad .dot{background:var(--bad)}
+    .muted{color:var(--muted)}
+    .split{display:grid;gap:14px}
+    @media(min-width:980px){ .split{grid-template-columns:1fr 1fr} }
+    pre{
+      margin:0;background:#0a1020;border:1px solid var(--line);
+      border-radius:12px;padding:10px;overflow:auto;max-height:420px;
+      font-family:var(--mono);font-size:12px;line-height:1.35
+    }
+    table{width:100%;border-collapse:collapse}
+    th,td{border-bottom:1px solid var(--line);padding:8px 6px;font-family:var(--mono);font-size:12px;text-align:left;vertical-align:top}
+    th{color:#cfe0ff;font-weight:600}
+    .small{font-size:12px}
+    .footerNote{margin-top:10px;color:var(--muted);font-size:12px}
+
+    /* Controls */
+    .controls{
+      margin:10px 0 12px 0;
+      padding:10px;
+      border:1px solid var(--line);
+      border-radius:12px;
+      background:#0f1830;
+      display:flex;
+      gap:10px;
+      align-items:center;
+      flex-wrap:wrap;
+    }
+    .controls label{font-size:12px;color:var(--muted)}
+    select{
+      background:#0a1020;
+      color:var(--text);
+      border:1px solid var(--line);
+      border-radius:10px;
+      padding:8px 10px;
+      font-family:var(--mono);
+      font-size:12px;
+      outline:none;
+    }
+    .toast{
+      width:100%;
+      font-family:var(--mono);
+      font-size:12px;
+      color:var(--muted);
+      display:flex;
+      gap:8px;
+      align-items:center;
+    }
+    .toast .tag{
+      display:inline-flex;
+      align-items:center;
+      gap:6px;
+      padding:2px 8px;
+      border:1px solid var(--line);
+      border-radius:999px;
+      color:var(--muted);
+    }
+    .toast .tag.ok{color:var(--ok); border-color:#245a48}
+    .toast .tag.warn{color:var(--warn); border-color:#5b4b2a}
+    .toast .tag.bad{color:var(--bad); border-color:#5b2a2a}
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand">Gateway Manager</div>
+    <div id="pillGw" class="pill">gatewayd: <b>…</b></div>
+    <div id="pillMc" class="pill">mcptt-bridge: <b>…</b></div>
+
+    <div class="right">
+      <div class="pill">refresh: <b id="refreshMs">1000ms</b></div>
+      <button id="btnPause">Pause</button>
+      <button id="btnRefresh">Refresh now</button>
+    </div>
+  </header>
+
+  <div class="wrap">
+    <div class="grid">
+      <div class="card">
+        <h2>Overall status</h2>
+        <div class="row" style="margin-bottom:10px">
+          <div id="badgeGw" class="badge"><span class="dot"></span><span>gatewayd</span></div>
+          <div id="badgeMc" class="badge"><span class="dot"></span><span>mcptt-bridge</span></div>
+          <div id="badgeFsm" class="badge"><span class="dot"></span><span>FSM</span></div>
+        </div>
+
+        <!-- NEW: MCPTT controls -->
+        <div class="controls">
+          <label for="mcSelect">MCPTT endpoint</label>
+          <select id="mcSelect">
+            <option value="mcptt_a" selected>mcptt_a</option>
+          </select>
+
+          <button id="btnMcConnect" class="btnPrimary">Connect</button>
+          <button id="btnMcDisconnect" class="btnDanger">Disconnect</button>
+
+          <div class="toast">
+            <span id="toastTag" class="tag"><span class="dot"></span><span id="toastLevel">idle</span></span>
+            <span id="toastMsg">Ready.</span>
+          </div>
+        </div>
+
+        <div class="split">
+          <div>
+            <div class="kvs">
+              <div class="k">gatewayd now</div><div class="v" id="gwNow">…</div>
+              <div class="k">FSM state</div><div class="v" id="fsmState">…</div>
+              <div class="k">TX owner</div><div class="v" id="txOwner">…</div>
+              <div class="k">FSM updated</div><div class="v" id="fsmUpdated">…</div>
+            </div>
+          </div>
+          <div>
+            <div class="kvs">
+              <div class="k">MCPTT transport</div><div class="v" id="mcTransport">…</div>
+              <div class="k">Call active</div><div class="v" id="mcCallActive">…</div>
+              <div class="k">PTT / floor</div><div class="v" id="mcPttFloor">…</div>
+              <div class="k">Bridge updated</div><div class="v" id="mcUpdated">…</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="footerNote">
+          Tip: connect/disconnect is proxied via gatewayd: <span class="v">/api/endpoints/&lt;id&gt;/session/(start|stop)</span>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>IO snapshot</h2>
+        <div class="small muted" style="margin-bottom:8px">Derived from gatewayd ring buffer. Useful for checking recent RX/TX/PTT activity per interface.</div>
+        <div style="overflow:auto;max-height:420px;border:1px solid var(--line);border-radius:12px">
+          <table>
+            <thead>
+              <tr>
+                <th>interface</th>
+                <th>last</th>
+                <th>rx</th>
+                <th>tx</th>
+                <th>ptt</th>
+              </tr>
+            </thead>
+            <tbody id="ioBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <div class="grid" style="margin-top:14px">
+      <div class="card">
+        <h2>Latest events (gatewayd)</h2>
+        <pre id="eventsPre">…</pre>
+      </div>
+
+      <div class="card">
+        <h2>Raw snapshots</h2>
+        <div class="split">
+          <div>
+            <div class="small muted" style="margin-bottom:6px">GET /api/health</div>
+            <pre id="rawGw">…</pre>
+          </div>
+          <div>
+            <div class="small muted" style="margin-bottom:6px">GET /api/mcptt/health</div>
+            <pre id="rawMc">…</pre>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+<script>
+(function(){
+  const REFRESH_MS = 1000;
+  let paused = false;
+  let actionInFlight = false;
+
+  const el = (id)=>document.getElementById(id);
+  el("refreshMs").textContent = REFRESH_MS + "ms";
+
+  function badgeSet(node, level, text){
+    node.classList.remove("ok","warn","bad");
+    node.classList.add(level);
+    node.querySelector("span:last-child").textContent = text;
+  }
+
+  function toast(level, msg){
+    const tag = el("toastTag");
+    const lvl = el("toastLevel");
+    const m = el("toastMsg");
+
+    tag.classList.remove("ok","warn","bad");
+    if (level === "ok" || level === "warn" || level === "bad") tag.classList.add(level);
+    lvl.textContent = level;
+    m.textContent = msg;
+  }
+
+  function setActionBusy(b){
+    actionInFlight = b;
+    el("btnMcConnect").disabled = b;
+    el("btnMcDisconnect").disabled = b;
+    el("mcSelect").disabled = b;
+  }
+
+  function safeJson(obj){
+    try { return JSON.stringify(obj, null, 2); } catch { return String(obj); }
+  }
+
+  async function getJson(path){
+    const r = await fetch(path, { cache:"no-store" });
+    const t = await r.text();
+    let j = null;
+    try { j = JSON.parse(t); } catch {}
+    return { ok: r.ok, status: r.status, json: j, text: t };
+  }
+
+  async function postJson(path){
+    const r = await fetch(path, {
+      method: "POST",
+      cache: "no-store",
+      headers: { "Content-Type": "application/json" },
+      body: "{}"
+    });
+    const t = await r.text();
+    let j = null;
+    try { j = JSON.parse(t); } catch {}
+    return { ok: r.ok, status: r.status, json: j, text: t };
+  }
+
+  function fmtBool(v){
+    if (v === true) return "true";
+    if (v === false) return "false";
+    return "null";
+  }
+
+  function tsToLocal(ts){
+    if (!ts) return "";
+    try{
+      if (typeof ts === "number") return new Date(ts).toLocaleString();
+      if (typeof ts === "string") return ts;
+    }catch{}
+    return String(ts);
+  }
+
+  function renderIO(io){
+    const body = el("ioBody");
+    body.innerHTML = "";
+    const ifaces = io?.ifaces || [];
+    for (const it of ifaces){
+      const tr = document.createElement("tr");
+      const td = (s)=>{ const x=document.createElement("td"); x.textContent=s||""; return x; };
+      tr.appendChild(td(it.interface_id || it.InterfaceID || ""));
+      tr.appendChild(td((it.last_event_type||it.LastEventType||"") + (it.last_event_ts||it.LastEventTs ? ("\n" + (it.last_event_ts||it.LastEventTs)) : "")));
+      tr.appendChild(td((it.last_rx_event_type||it.LastRxType||"") + (it.last_rx_ts||it.LastRxTs ? ("\n" + (it.last_rx_ts||it.LastRxTs)) : "")));
+      tr.appendChild(td((it.last_tx_event_type||it.LastTxType||"") + (it.last_tx_ts||it.LastTxTs ? ("\n" + (it.last_tx_ts||it.LastTxTs)) : "")));
+      let ptt = (it.last_ptt_event_type||it.LastPttType||"");
+      const asserted = (it.ptt_asserted ?? it.PttAsserted);
+      if (asserted === true) ptt += (ptt ? " " : "") + "(asserted)";
+      if (asserted === false) ptt += (ptt ? " " : "") + "(released)";
+      const pttTs = (it.last_ptt_ts||it.LastPttTs||"");
+      tr.appendChild(td(ptt + (pttTs ? ("\n" + pttTs) : "")));
+      body.appendChild(tr);
+    }
+  }
+
+  function classifyMc(mc){
+    const st = mc?.state || {};
+    const transport = st.sip_transport;
+    const callActive = !!st.call_active;
+
+    if (transport === "connected") return { level: callActive ? "ok" : "warn", text: callActive ? "transport up / call active" : "transport up / idle" };
+    if (transport === "connecting") return { level: "warn", text: "connecting" };
+    if (transport === "disconnected") return { level: "bad", text: "disconnected" };
+    return { level: "warn", text: "unknown" };
+  }
+
+  function endpointId(){
+    return el("mcSelect").value || "mcptt_a";
+  }
+
+  async function mcpttAction(which){
+    // which: "start" or "stop"
+    const id = endpointId();
+    const path = `/api/endpoints/${encodeURIComponent(id)}/session/${which}`;
+    try{
+      setActionBusy(true);
+      toast("warn", `${which.toUpperCase()} requested for ${id}…`);
+      const res = await postJson(path);
+      if (!res.ok){
+        toast("bad", `${which.toUpperCase()} failed (${res.status}): ${res.text || "(no body)"}`);
+        return;
+      }
+      // expect {"ok":true}
+      if (res.json && res.json.ok === true){
+        toast("ok", `${which.toUpperCase()} accepted for ${id}.`);
+      } else {
+        toast("warn", `${which.toUpperCase()} response: ${res.text || safeJson(res.json)}`);
+      }
+      // kick a refresh quickly so the UI updates immediately
+      await refresh();
+    } catch (e){
+      toast("bad", `${which.toUpperCase()} error: ${e?.message || String(e)}`);
+    } finally {
+      setActionBusy(false);
+    }
+  }
+
+  async function refresh(){
+    if (paused) return;
+
+    const [gw, st, io, ev, mc] = await Promise.all([
+      getJson("/api/health"),
+      getJson("/api/state"),
+      getJson("/api/io?limit=500"),
+      getJson("/api/events?limit=50"),
+      getJson("/api/mcptt/health")
+    ]);
+
+    // gatewayd pill + badge
+    if (gw.ok && gw.json){
+      el("pillGw").innerHTML = 'gatewayd: <b>ok</b>';
+      badgeSet(el("badgeGw"), "ok", "gatewayd OK");
+      el("rawGw").textContent = safeJson(gw.json);
+      el("gwNow").textContent = String(gw.json?.runtime?.now ?? "");
+    } else {
+      el("pillGw").innerHTML = 'gatewayd: <b class="bad">down</b>';
+      badgeSet(el("badgeGw"), "bad", "gatewayd DOWN");
+      el("rawGw").textContent = gw.text || "(no response)";
+      el("gwNow").textContent = "";
+    }
+
+    // FSM
+    if (st.ok && st.json){
+      const f = st.json?.fsm || {};
+      const fs = String(f.state || "");
+      el("fsmState").textContent = fs;
+      el("txOwner").textContent = String(f.tx_owner || "");
+      el("fsmUpdated").textContent = String(f.updated_at || "");
+      badgeSet(el("badgeFsm"), fs === "idle" ? "warn" : "ok", fs ? ("FSM " + fs) : "FSM");
+    } else {
+      el("fsmState").textContent = "(unavailable)";
+      el("txOwner").textContent = "";
+      el("fsmUpdated").textContent = "";
+      badgeSet(el("badgeFsm"), "bad", "FSM unavailable");
+    }
+
+    // IO
+    if (io.ok && io.json) renderIO(io.json);
+    else el("ioBody").innerHTML = '<tr><td colspan="5">(unavailable)</td></tr>';
+
+    // Events
+    if (ev.ok && ev.json){
+      el("eventsPre").textContent = safeJson(ev.json);
+    } else {
+      el("eventsPre").textContent = ev.text || "(unavailable)";
+    }
+
+    // mcptt
+    if (mc.ok && mc.json){
+      el("pillMc").innerHTML = 'mcptt-bridge: <b>ok</b>';
+      el("rawMc").textContent = safeJson(mc.json);
+
+      const stMc = mc.json?.state || {};
+      el("mcTransport").textContent = String(stMc.sip_transport ?? "");
+      el("mcCallActive").textContent = fmtBool(stMc.call_active);
+      el("mcPttFloor").textContent = `${String(stMc.ptt ?? "")} / ${stMc.floorOwner ?? "null"}`;
+      el("mcUpdated").textContent = tsToLocal(stMc.updatedAt);
+
+      const c = classifyMc(mc.json);
+      badgeSet(el("badgeMc"), c.level, "mcptt-bridge " + c.text);
+
+      // If user hasn't clicked anything, keep toast subtle and non-spammy:
+      // only update toast when action is not in flight and toast is still "idle"/"Ready."
+      if (!actionInFlight && (el("toastLevel").textContent === "idle" || el("toastMsg").textContent === "Ready.")){
+        toast(c.level, `MCPTT ${c.text}.`);
+      }
+    } else {
+      el("pillMc").innerHTML = 'mcptt-bridge: <b class="bad">down</b>';
+      badgeSet(el("badgeMc"), "bad", "mcptt-bridge DOWN");
+      el("rawMc").textContent = mc.text || "(unavailable)";
+      el("mcTransport").textContent = "";
+      el("mcCallActive").textContent = "";
+      el("mcPttFloor").textContent = "";
+      el("mcUpdated").textContent = "";
+      if (!actionInFlight) toast("bad", "MCPTT health unavailable.");
+    }
+  }
+
+  // header controls
+  el("btnPause").addEventListener("click", ()=>{
+    paused = !paused;
+    el("btnPause").textContent = paused ? "Resume" : "Pause";
+    if (!paused) refresh();
+  });
+  el("btnRefresh").addEventListener("click", ()=>refresh());
+
+  // NEW: connect/disconnect buttons
+  el("btnMcConnect").addEventListener("click", ()=>mcpttAction("start"));
+  el("btnMcDisconnect").addEventListener("click", ()=>mcpttAction("stop"));
+
+  // initial + interval
+  refresh();
+  setInterval(refresh, REFRESH_MS);
+})();
+</script>
+</body>
+</html>
