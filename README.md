@@ -264,7 +264,9 @@ active (running)
 ```
 If either service is failed or inactive, the UI will not function correctly.
 
+
 ### 2. Check the services are listening on the expected ports
+
 
 ```
 sudo ss -tulpen | grep -E '5071|5072'
@@ -278,6 +280,22 @@ Confirms the core services are running.
 | 5071  |gatewayd API  |
 | 5072  | mcptt-bridge API |
 
+If nothing is listening, the service failed to start.
+
+
+### 3. Test gatewayd health API
+```
+curl -s http://127.0.0.1:5071/api/health | jq
+```
+#### Purpose
+Confirms the Go gateway core is responding.
+
+#### Expected
+
+```
+"ok": true
+```
+If this fails, the UI cannot retrieve gateway state.
 ---
 
 Stable checkpoints are tagged in Git:
@@ -286,6 +304,98 @@ Stable checkpoints are tagged in Git:
 v0.4-rulebased-lock-stable
 v0.6-gpio-gpiod-readback-test-stable
 ```
+
+### 4. Test MCPTT bridge health
+```
+curl -s http://127.0.0.1:5072/api/health | jq
+```
+#### Purpose
+Confirms the MCPTT bridge service is alive.
+
+#### Expected fields include:
+- connected
+- call_active
+- ptt
+- sip_transport
+
+If this fails, the MCPTT endpoint will not function.
+
+
+### 5. Check recent gateway events
+```
+curl -s http://127.0.0.1:5071/api/events?limit=10 | jq
+```
+#### Purpose
+Displays the most recent gateway activity, including:
+
+- rx_start
+- tx_start
+- tx_stop
+- link_up
+
+Useful for confirming routing logic is working.
+
+
+### 6. Check gateway logs
+```
+sudo journalctl -u gatewayd --since "5 minutes ago" --no-pager
+```
+#### Purpose
+Shows recent logs from the gateway core.
+
+#### Look for:
+
+- error
+- endpoint connect failed
+- routing failures
+
+
+### 7. Check MCPTT bridge logs
+```
+sudo journalctl -u mcptt-bridge --since "5 minutes ago" --no-pager
+```
+#### Purpose
+Shows logs from the bridge responsible for:
+
+- SIP registration
+- call control
+- PTT events
+
+
+### 8. Quick connectivity test from host
+```
+curl -I http://127.0.0.1:5071
+```
+#### Purpose
+Confirms the HTTP server is reachable.
+
+#### Expected
+
+```
+HTTP/1.1 200 OK
+```
+If this fails, the web UI cannot load data.
+
+
+---
+
+Stable checkpoints are tagged in Git:
+
+```
+v0.4-rulebased-lock-stable
+v0.6-gpio-gpiod-readback-test-stable
+```
+
+
+---
+
+Stable checkpoints are tagged in Git:
+
+```
+v0.4-rulebased-lock-stable
+v0.6-gpio-gpiod-readback-test-stable
+```
+
 
 ---
 
