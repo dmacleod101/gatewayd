@@ -231,6 +231,24 @@ func (g *Core) lockedDestinationForTXStop() (string, bool) {
 	return g.txDestLockDestID, true
 }
 
+// emitSyntheticTxEvent writes a synthetic tx_start/tx_stop into the ring buffer so /api/io can reflect
+// gateway-driven TX on endpoints that don't naturally emit tx_* events (e.g. GPIO PTT).
+func (g *Core) emitSyntheticTxEvent(destID string, typ string, source string) {
+	if destID == "" {
+		return
+	}
+	g.ring.Add(map[string]any{
+		"ts":           time.Now().UTC().Format(time.RFC3339Nano),
+		"interface_id": destID,
+		"event_type":   typ, // "tx_start" or "tx_stop"
+		"origin_id":    "gatewayd",
+		"meta": map[string]any{
+			"synthetic": true,
+			"source":    source,
+		},
+	})
+}
+
 func (g *Core) Run(ctx context.Context) error {
 	// Attach event sinks (out-of-band interface_id) + connect endpoints
 	for _, ep := range g.endpoints {
@@ -383,6 +401,10 @@ func (g *Core) Run(ctx context.Context) error {
 								"source":  e.InterfaceID,
 								"dest":    usedDestID,
 							})
+							// If TXStop results in ptt_up, reflect that as tx_stop on the dest.
+							if cmd == "ptt_up" {
+								g.emitSyntheticTxEvent(usedDestID, "tx_stop", e.InterfaceID)
+							}
 							g.clearTXDestinationLock("tx_stop_processed")
 						} else {
 							g.log.Error("tx_stop_not_sent", map[string]any{
@@ -410,6 +432,10 @@ func (g *Core) Run(ctx context.Context) error {
 								"source":  e.InterfaceID,
 								"dest":    usedDestID,
 							})
+							// If TXStop results in ptt_up, reflect that as tx_stop on the dest.
+							if cmd == "ptt_up" {
+								g.emitSyntheticTxEvent(usedDestID, "tx_stop", e.InterfaceID)
+							}
 							g.clearTXDestinationLock("tx_stop_processed")
 						} else {
 							g.log.Error("tx_stop_not_sent", map[string]any{
@@ -488,6 +514,10 @@ func (g *Core) Run(ctx context.Context) error {
 								"source":  e.InterfaceID,
 								"dest":    destID,
 							})
+							// If TXStart results in ptt_down, reflect that as tx_start on the dest.
+							if cmd == "ptt_down" {
+								g.emitSyntheticTxEvent(destID, "tx_start", e.InterfaceID)
+							}
 						}
 
 					default:
@@ -505,6 +535,12 @@ func (g *Core) Run(ctx context.Context) error {
 								"source":  e.InterfaceID,
 								"dest":    destID,
 							})
+							// Some non-TXStart paths may still assert PTT.
+							if cmd == "ptt_down" {
+								g.emitSyntheticTxEvent(destID, "tx_start", e.InterfaceID)
+							} else if cmd == "ptt_up" {
+								g.emitSyntheticTxEvent(destID, "tx_stop", e.InterfaceID)
+							}
 						}
 					}
 
@@ -538,6 +574,9 @@ func (g *Core) Run(ctx context.Context) error {
 								"source":  e.InterfaceID,
 								"dest":    destID,
 							})
+							if cmd == "ptt_down" {
+								g.emitSyntheticTxEvent(destID, "tx_start", e.InterfaceID)
+							}
 						}
 
 					default:
@@ -555,6 +594,11 @@ func (g *Core) Run(ctx context.Context) error {
 								"source":  e.InterfaceID,
 								"dest":    destID,
 							})
+							if cmd == "ptt_down" {
+								g.emitSyntheticTxEvent(destID, "tx_start", e.InterfaceID)
+							} else if cmd == "ptt_up" {
+								g.emitSyntheticTxEvent(destID, "tx_stop", e.InterfaceID)
+							}
 						}
 					}
 
