@@ -450,6 +450,21 @@
     getState: () => ({ ...state })
   };
 
+  // ---------------------------
+  // State heartbeat (keeps /api/health.state.updatedAt fresh while idle)
+  // ---------------------------
+  const HEARTBEAT_MS = Number(CFG.stateHeartbeatMs || 1000);
+  setInterval(() => {
+    try {
+      if (typeof window.__bridgeReportState === "function") {
+        window.__bridgeReportState({ ...state, updatedAt: now() });
+      }
+    } catch {
+      // never break
+    }
+  }, (Number.isFinite(HEARTBEAT_MS) && HEARTBEAT_MS >= 250) ? HEARTBEAT_MS : 1000);
+
+
   // Initial state/event
   reportState({
     connected: false,
